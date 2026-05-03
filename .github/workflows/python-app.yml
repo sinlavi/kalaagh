@@ -36,10 +36,15 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
         run: python main.py
-
+        
       - name: Commit and push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add processed_urls.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update processed URLs" && git push)
+          
+          if [ -f processed_urls.json ]; then
+            git add processed_urls.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update processed URLs" && git push)
+          else
+            echo "No processed_urls.json found. Skipping commit."
+          fi
