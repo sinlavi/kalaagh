@@ -1,3 +1,2 @@
 balethon
-google-genai
-feedparser
+yt-dlp
