@@ -1,0 +1,3 @@
+balethon
+google-genai
+feedparser
