@@ -182,7 +182,7 @@ async def callback_handler(client, callback_query):
 
     if data.startswith("show:"):
         sc_id = data.split(":")[1]
-        await callback_query.answer()
+        await callback_query.answer('..')
         await show_track_info(client, chat_id, sc_id, is_url=False)
 
     elif data.startswith("dl:"):
