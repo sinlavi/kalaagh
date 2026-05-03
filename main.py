@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from balethon import Client
-from balethon.conditions import private, command, text, group
+from balethon.conditions import private, command, text
 from balethon.objects import InlineKeyboard, Message
 
 import yt_dlp
@@ -19,7 +19,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = "sc_archive.db"
 
 bot = Client(BALE_TOKEN)
-bot_username = "" # به صورت خودکار پر می‌شود
+bot_username = ""
 
 # ================= مدیریت دیتابیس =================
 def init_db():
@@ -39,13 +39,6 @@ def init_db():
 
 init_db()
 
-def get_track_by_url(url):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM tracks WHERE url = ?", (url,))
-        return dict(c.fetchone() or {})
-
 def get_track_by_id(sc_id):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -53,28 +46,37 @@ def get_track_by_id(sc_id):
         c.execute("SELECT * FROM tracks WHERE sc_id = ?", (sc_id,))
         return dict(c.fetchone() or {})
 
-def search_tracks(keyword):
+def get_track_by_url(url):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM tracks WHERE title LIKE ? OR uploader LIKE ? LIMIT 10", (f"%{keyword}%", f"%{keyword}%"))
-        return [dict(row) for row in c.fetchall()]
+        c.execute("SELECT * FROM tracks WHERE url = ?", (url,))
+        return dict(c.fetchone() or {})
 
 def save_track(data):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute('''
             INSERT OR REPLACE INTO tracks (sc_id, url, title, uploader, thumbnail, channel_msg_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (data['sc_id'], data['url'], data['title'], data['uploader'], data.get('thumbnail'), data.get('channel_msg_id')))
+            VALUES (?, ?, ?, ?, COALESCE(?, (SELECT thumbnail FROM tracks WHERE sc_id = ?)), COALESCE(?, (SELECT channel_msg_id FROM tracks WHERE sc_id = ?)))
+        ''', (data['sc_id'], data['url'], data['title'], data['uploader'], 
+              data.get('thumbnail'), data['sc_id'], 
+              data.get('channel_msg_id'), data['sc_id']))
         conn.commit()
 
-# ================= توابع ساندکلاود =================
+# ================= توابع yt-dlp =================
+def search_sc_online(keyword):
+    """جستجو در ساندکلاود با استفاده از yt-dlp"""
+    ydl_opts = {'quiet': True, 'extract_flat': True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # جستجوی 5 نتیجه اول در ساندکلاود
+        info = ydl.extract_info(f"scsearch5:{keyword}", download=False)
+        return info.get('entries', [])
+
 def fetch_sc_info(url):
     ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info
+        return ydl.extract_info(url, download=False)
 
 def download_sc_audio(url):
     ydl_opts = {
@@ -96,69 +98,75 @@ async def on_connect(client):
 
 @bot.on_message(command("start"))
 async def start_handler(client, message):
-    await message.reply("سلام! لینک ساندکلاود بفرست تا اطلاعاتشو بیارم یا متنی بفرست تا تو آرشیو سرچ کنم.")
+    await message.reply("سلام! لینک ساندکلاود بفرست یا متنی بفرست تا در ساندکلاود جستجو کنم.")
 
 async def process_search(message, keyword):
-    results = search_tracks(keyword)
-    if not results:
-        return await message.reply("متاسفانه چیزی در آرشیو پیدا نشد.")
+    msg = await message.reply("🔍 در حال جستجو در ساندکلاود...")
+    loop = asyncio.get_event_loop()
+    
+    try:
+        results = await loop.run_in_executor(None, search_sc_online, keyword)
+    except Exception as e:
+        return await msg.edit_text("❌ خطا در جستجو.")
 
+    if not results:
+        return await msg.edit_text("متاسفانه نتیجه‌ای در ساندکلاود پیدا نشد.")
+    
     buttons = []
     for res in results:
-        buttons.append([(f"🎵 {res['title'][:20]} - {res['uploader'][:15]}", f"show:{res['sc_id']}")])
-
+        # ذخیره اولیه در دیتابیس برای استفاده در کال‌بک
+        save_track({
+            'sc_id': res['id'],
+            'url': res['url'],
+            'title': res.get('title', 'نامشخص'),
+            'uploader': res.get('uploader', 'نامشخص')
+        })
+        buttons.append([(f"🎵 {res.get('title', '')[:20]} - {res.get('uploader', '')[:15]}", f"show:{res['id']}")])
+    
     keyboard = InlineKeyboard(*buttons)
-    await message.reply(f"نتایج جستجو برای: {keyword}", keyboard)
+    await msg.edit_text(f"نتایج جستجو برای: {keyword}", reply_markup=keyboard)
 
-async def process_sc_link(client, message, url):
-    msg = await message.reply("در حال دریافت اطلاعات ساندکلاود...")
-
-    # بررسی کش در دیتابیس
-    cached = get_track_by_url(url)
-
-    if cached and cached.get('channel_msg_id'):
-        title = cached['title']
-        uploader = cached['uploader']
-        sc_id = cached['sc_id']
-        thumb = cached['thumbnail']
-    else:
+async def show_track_info(client, chat_id, url_or_id, is_url=False):
+    # دریافت از دیتابیس در صورت وجود
+    cached = get_track_by_url(url_or_id) if is_url else get_track_by_id(url_or_id)
+    url = url_or_id if is_url else cached['url']
+    
+    # اگر کاور آرت ثبت نشده بود، اطلاعات کامل را می‌گیریم
+    if not cached or not cached.get('thumbnail'):
         loop = asyncio.get_event_loop()
         try:
             info = await loop.run_in_executor(None, fetch_sc_info, url)
-            title = info.get('title', 'نامشخص')
-            uploader = info.get('uploader', 'نامشخص')
-            sc_id = info.get('id')
-            thumb = info.get('thumbnail', '')
+            cached = {
+                'sc_id': info['id'],
+                'url': url,
+                'title': info.get('title', 'نامشخص'),
+                'uploader': info.get('uploader', 'نامشخص'),
+                'thumbnail': info.get('thumbnail', '')
+            }
+            save_track(cached)
+        except Exception:
+            return await client.send_message(chat_id, "❌ خطا در دریافت اطلاعات تکمیلی.")
 
-            # ذخیره اطلاعات اولیه بدون آیدی پیام کانال
-            save_track({'sc_id': sc_id, 'url': url, 'title': title, 'uploader': uploader, 'thumbnail': thumb})
-        except Exception as e:
-            return await msg.edit_text(f"خطا در دریافت اطلاعات: {e}")
+    text_info = f"🎵 **عنوان:** {cached['title']}\n👤 **هنرمند:** {cached['uploader']}"
+    keyboard = InlineKeyboard([("📥 دانلود", f"dl:{cached['sc_id']}")])
 
-    text_info = f"🎵 **عنوان:** {title}\n👤 **هنرمند:** {uploader}"
-    keyboard = InlineKeyboard([("📥 دانلود فایل صوتی", f"dl:{sc_id}")])
-
-    await msg.delete()
-    if thumb:
-        await client.send_photo(message.chat.id, thumb, caption=text_info, reply_markup=keyboard)
+    if cached.get('thumbnail'):
+        await client.send_photo(chat_id, cached['thumbnail'], caption=text_info, reply_markup=keyboard)
     else:
-        await message.reply(text_info, keyboard)
+        await client.send_message(chat_id, text_info, reply_markup=keyboard)
 
 @bot.on_message(text)
 async def text_handler(client, message: Message):
     text_content = message.text
-
     if text_content.startswith("/"): return
 
-    # استخراج لینک
     url_match = re.search(r'(https?://(?:www\.|on\.)?soundcloud\.com/[^\s]+)', text_content)
-
     is_pv = message.chat.type == "private"
     mentioned = bot_username and f"@{bot_username}" in text_content
 
     if url_match:
         if is_pv or mentioned:
-            await process_sc_link(client, message, url_match.group(1))
+            await show_track_info(client, message.chat.id, url_match.group(1), is_url=True)
     else:
         if is_pv:
             await process_search(message, text_content)
@@ -174,53 +182,47 @@ async def callback_handler(client, callback_query):
 
     if data.startswith("show:"):
         sc_id = data.split(":")[1]
-        cached = get_track_by_id(sc_id)
-        if not cached:
-            return await callback_query.answer("اطلاعات یافت نشد!")
-
-        text_info = f"🎵 **عنوان:** {cached['title']}\n👤 **هنرمند:** {cached['uploader']}"
-        keyboard = InlineKeyboard([("📥 دانلود", f"dl:{sc_id}")])
-        if cached['thumbnail']:
-            await client.send_photo(chat_id, cached['thumbnail'], caption=text_info, reply_markup=keyboard)
-        else:
-            await client.send_message(chat_id, text_info, reply_markup=keyboard)
         await callback_query.answer()
+        await show_track_info(client, chat_id, sc_id, is_url=False)
 
     elif data.startswith("dl:"):
         sc_id = data.split(":")[1]
         cached = get_track_by_id(sc_id)
-
+        
         if not cached:
             return await callback_query.answer("خطا! دیتای آهنگ موجود نیست.")
 
-        # اگر قبلا دانلود شده و در کانال هست
+        # چک کردن کانال آرشیو
         if cached.get('channel_msg_id'):
-            await callback_query.answer("در حال ارسال از آرشیو...")
-            await client.send_audio(chat_id, cached['channel_msg_id'])
-            return
+            await callback_query.answer("🚀 در حال ارسال از آرشیو...")
+            return await client.send_audio(chat_id, cached['channel_msg_id'])
 
-        # اگر دانلود نشده
-        await callback_query.answer("در حال دانلود، لطفا صبور باشید...")
-        msg = await client.send_message(chat_id, "⏳ در حال دانلود و آپلود...")
+        # دانلود از yt-dlp در صورت عدم وجود در آرشیو
+        await callback_query.answer("⏳ در حال دانلود از ساندکلاود...")
+        msg = await client.send_message(chat_id, "⏳ در حال دانلود، لطفا صبور باشید...")
         loop = asyncio.get_event_loop()
-
+        
         try:
             filepath = await loop.run_in_executor(None, download_sc_audio, cached['url'])
-
-            # ارسال به کانال آرشیو
-            archive_msg = await client.send_audio(CHANNEL_ID, filepath, caption=f"{cached['title']} - {cached['uploader']}")
-
-            # بروزرسانی دیتابیس
+            
+            # آپلود در کانال آرشیو
+            archive_msg = await client.send_audio(
+                CHANNEL_ID, 
+                filepath, 
+                caption=f"🎵 {cached['title']} \n👤 {cached['uploader']}"
+            )
+            
+            # ثبت آیدی پیام در دیتابیس
             cached['channel_msg_id'] = archive_msg.document.id
             save_track(cached)
-
-            # ارسال به کاربر
+            
+            # ارسال برای کاربر
             await client.send_audio(chat_id, archive_msg.document.id)
             await msg.delete()
-
+            
             if os.path.exists(filepath):
                 os.remove(filepath)
-
+                
         except Exception as e:
             await msg.edit_text(f"❌ خطا در دانلود: {e}")
 
