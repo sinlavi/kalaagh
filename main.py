@@ -60,7 +60,7 @@ def rewrite_news_with_gemini(title, summary, link):
     
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             contents=prompt
         )
         if hasattr(response, "text"):
