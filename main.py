@@ -23,13 +23,16 @@ bot = Client(BOT_TOKEN)
 
 def load_processed_urls():
     import os
+    import json # مطمئن شوید json ایمپورت شده است
+    
     if not os.path.exists("processed_urls.json"):
         return []
+    
     try:
         with open("processed_urls.json", "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError:
-        # اگر فایل وجود داشته باشد اما خالی یا نامعتبر باشد
+        # اگر فایل خالی باشد یا JSON معتبر نباشد، لیست خالی برمی‌گرداند
         return []
 
 def save_processed_urls(urls):
